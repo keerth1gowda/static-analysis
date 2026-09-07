@@ -351,7 +351,7 @@ Also check out the sister project, [awesome-dynamic-analysis](https://github.com
 
 - **effective_dart** :warning: — Linter rules corresponding to the guidelines in Effective Dart
 
-- **lint** :warning: — An opinionated, community-driven set of lint rules for Dart and Flutter projects. Like pedantic but stricter
+- [lint](https://github.com/passsy/dart-lint) — An opinionated, community-driven set of lint rules for Dart and Flutter projects. Like pedantic but stricter
 
 - **Linter for dart** :warning: — Style linter for Dart.
 
@@ -963,7 +963,7 @@ It uses the pycodestyle utility to determine what parts of the code needs to be 
 
 - **pydocstyle** :warning: — Check compliance with Python docstring conventions.
 
-- **pyflakes** :warning: — Check Python source files for errors.
+- [pyflakes](https://pypi.org/project/pyflakes) — Check Python source files for errors.
 
 - [pylint](http://pylint.pycqa.org/en/latest) — Looks for programming errors, helps enforcing a coding standard and sniffs for some code smells. It additionally includes `pyreverse` (an UML diagram generator) and `symilar` (a similarities checker).
 
