@@ -21,7 +21,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -45,7 +45,7 @@ jobs:
           echo "files=$FILES" >> "$GITHUB_OUTPUT"
           echo "has_files=$( [ -n "$FILES" ] && echo true || echo false )" >> "$GITHUB_OUTPUT"
 
-      - name: Skip: no tool files to check
+      - name: "Skip: no tool files to check"
         if: steps.changed.outputs.has_files == 'false'
         run: |
           mkdir -p pr-check-output
@@ -54,11 +54,13 @@ jobs:
 
       - name: Install Rust toolchain
         if: steps.changed.outputs.has_files == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.98.0
 
       - name: Cache cargo registry
         if: steps.changed.outputs.has_files == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -96,7 +98,7 @@ jobs:
 
       - name: Upload check results
         if: always() && github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pr-check-output
           path: pr-check-output/

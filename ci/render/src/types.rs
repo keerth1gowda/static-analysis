@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use askama::Template;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,22 +18,15 @@ pub enum Type {
 pub struct Tag {
     pub name: String,
     pub value: String,
-    #[serde(alias = "type")]
-    pub tag_type: Type,
+    #[serde(alias = "type", rename = "tag_type")]
+    pub kind: Type,
+    /// Include multi-language tools in this tag's rendered README section.
+    #[serde(default, skip_serializing)]
+    pub include_multi: bool,
 }
 
-impl Tag {
-    fn new(name: &str, value: &str, tag_type: Type) -> Self {
-        Self {
-            name: name.into(),
-            value: value.into(),
-            tag_type,
-        }
-    }
-}
-
-// The tags from tags.yml. Note that this is a `Vector<Tag>` and not a
-// `BTreeSet<Tag>` because we like to keep the sorting between renders.
+// The tags from tags.yml. This remains a `Vec<Tag>` rather than a
+// `BTreeSet<Tag>` so renders preserve the configured order.
 pub type Tags = Vec<Tag>;
 
 pub type EntryTags = BTreeSet<String>;
@@ -92,7 +85,7 @@ pub enum ToolType {
     #[serde(rename = "cli")]
     Commandline,
     #[serde(rename = "gui")]
-    GUI,
+    Gui,
     #[serde(rename = "service")]
     Service,
     #[serde(rename = "ide-plugin")]
@@ -120,24 +113,41 @@ pub struct Entry {
 }
 
 impl Entry {
+    #[must_use]
     pub fn is_c_cpp(&self) -> bool {
-        self.tags
-            == [
-                Tag::new("C", "c", Type::Language),
-                Tag::new("C++", "cpp", Type::Language),
-            ]
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<Tag>>()
+        let language_tags = self.tags.iter().filter(|tag| tag.kind == Type::Language);
+
+        language_tags.clone().count() == 2
+            && language_tags
+                .map(|tag| tag.value.as_str())
+                .all(|value| matches!(value, "c" | "cpp"))
     }
 
-    pub fn from_parsed(p: ParsedEntry, tags: &[Tag]) -> Result<Entry> {
+    /// Whether the tool is marked as deprecated or unmaintained.
+    #[must_use]
+    pub fn is_deprecated(&self) -> bool {
+        self.deprecated.unwrap_or(false)
+    }
+
+    /// Whether the tool uses the catalog's proprietary license marker.
+    #[must_use]
+    pub fn is_proprietary(&self) -> bool {
+        self.license == "proprietary"
+    }
+
+    /// Validates and normalizes one parsed catalog entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the entry fails validation or references an
+    /// unknown tag or tool type.
+    pub fn from_parsed(p: ParsedEntry, tags: &[Tag]) -> Result<Self> {
         valid(&p, tags)?;
 
         let tag_results: Vec<Result<Tag>> = p.tags.iter().map(|t| get_tag(t, tags)).collect();
         let tag_errors: Vec<String> = tag_results
             .iter()
-            .filter_map(|r| r.as_ref().err().map(|e| e.to_string()))
+            .filter_map(|r| r.as_ref().err().map(ToString::to_string))
             .collect();
         if !tag_errors.is_empty() {
             bail!(
@@ -158,7 +168,7 @@ impl Entry {
             })
             .collect();
 
-        Ok(Entry {
+        Ok(Self {
             name: p.name,
             categories: p.categories,
             tags: entry_tags?,
@@ -185,17 +195,17 @@ fn get_tag(t: &str, tags: &[Tag]) -> Result<Tag> {
             return Ok(tag.clone());
         }
     }
-    bail!("Invalid tag: {}", t)
+    bail!("Invalid tag: {t}")
 }
 
 impl PartialOrd for Entry {
-    fn partial_cmp(&self, other: &Entry) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for Entry {
-    fn cmp(&self, other: &Entry) -> Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         self.name.to_lowercase().cmp(&other.name.to_lowercase())
     }
 }
@@ -211,11 +221,12 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Arranges a tag map into three visually balanced table columns.
     fn rows(map: &EntryMap) -> Vec<Vec<(&Tag, &Vec<Entry>)>> {
         let num_columns = 3;
         let mut rows = Vec::new();
         let items: Vec<_> = map.iter().collect();
-        let items_per_column = (items.len() + num_columns - 1) / num_columns;
+        let items_per_column = items.len().div_ceil(num_columns);
 
         for i in 0..items_per_column {
             let mut row = Vec::new();
@@ -231,10 +242,12 @@ impl Catalog {
         rows
     }
 
+    #[must_use]
     pub fn linter_rows(&self) -> Vec<Vec<(&Tag, &Vec<Entry>)>> {
         Self::rows(&self.linters)
     }
 
+    #[must_use]
     pub fn other_rows(&self) -> Vec<Vec<(&Tag, &Vec<Entry>)>> {
         Self::rows(&self.others)
     }

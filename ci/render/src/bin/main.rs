@@ -19,6 +19,8 @@ struct Args {
     skip_deprecated: bool,
 }
 
+// `pico_args::value_from_os_str` requires a fallible parser callback.
+#[allow(clippy::unnecessary_wraps)]
 fn parse_path(s: &OsStr) -> Result<PathBuf> {
     Ok(s.into())
 }
@@ -33,9 +35,10 @@ fn read_tools(path: PathBuf) -> Result<Vec<ParsedEntry>> {
 
     let files = dir
         .map(|res| res.map(|e| e.path()))
-        .filter(|x| match x {
-            Ok(pb) => pb.extension().and_then(OsStr::to_str) == Some("yml"),
-            Err(_) => false,
+        .filter(|result| {
+            result
+                .as_ref()
+                .is_ok_and(|path| path.extension().and_then(OsStr::to_str) == Some("yml"))
         })
         .collect::<Result<Vec<_>, io::Error>>()?;
 
@@ -52,9 +55,8 @@ fn read_tools(path: PathBuf) -> Result<Vec<ParsedEntry>> {
 
 /// Backfills the deprecated field in the tools data from the old tools data.
 fn backfill_deprecated(tools: &mut Vec<Entry>) -> Result<()> {
-    let tools_raw = match fs::read_to_string("data/api/tools.json") {
-        Ok(content) => content,
-        Err(_) => return Ok(()), // No old data to backfill from. Skip silently.
+    let Ok(tools_raw) = fs::read_to_string("data/api/tools.json") else {
+        return Ok(()); // No old data to backfill from. Skip silently.
     };
 
     let old_tools_data: BTreeMap<String, serde_json::Value> = serde_json::from_str(&tools_raw)?;
@@ -64,14 +66,17 @@ fn backfill_deprecated(tools: &mut Vec<Entry>) -> Result<()> {
         if let Some(old_tool) = old_tools_data.get(&id) {
             // Only backfill deprecated if it's not already set
             if tool.deprecated.is_none() {
-                tool.deprecated = old_tool.get("deprecated").and_then(|d| d.as_bool());
+                tool.deprecated = old_tool
+                    .get("deprecated")
+                    .and_then(serde_json::Value::as_bool);
             }
         }
     }
     Ok(())
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let mut args = Arguments::from_env();
     let args = Args {
         tags: args.value_from_os_str("--tags", parse_path)?,
@@ -95,7 +100,10 @@ fn main() -> Result<()> {
     let github_token = env::var("GITHUB_TOKEN");
 
     match (should_check_deprecation, github_token) {
-        (true, Ok(token)) => check_deprecated(token, &mut tools)?,
+        (true, Ok(token)) => {
+            println!("Checking for deprecated entries on GitHub. This might take a while...");
+            check_deprecated(&token, &mut tools).await?;
+        }
         (true, Err(_)) => {
             eprintln!("No GITHUB_TOKEN environment variable found. Reusing old deprecation data.");
             backfill_deprecated(&mut tools)?;
@@ -106,22 +114,18 @@ fn main() -> Result<()> {
     let languages: Vec<Tag> = tags
         .clone()
         .into_iter()
-        .filter(|t| t.tag_type == Type::Language)
+        .filter(|t| t.kind == Type::Language)
         .collect();
 
-    let other_tags: Vec<Tag> = tags
-        .clone()
-        .into_iter()
-        .filter(|t| t.tag_type == Type::Other)
-        .collect();
+    let other_tags: Vec<Tag> = tags.into_iter().filter(|t| t.kind == Type::Other).collect();
 
-    let catalog = create_catalog(&tools, &languages, &other_tags)?;
+    let catalog = create_catalog(&tools, &languages, &other_tags);
     fs::write(&args.md_out, catalog.render()?).context(format!(
         "Cannot write Markdown output to {}",
         args.md_out.display()
     ))?;
 
-    let api = create_api(catalog, &languages, &other_tags)?;
+    let api = create_api(tools, &languages, &other_tags);
 
     let json = serde_json::to_string_pretty(&api)?;
     let tools_out = args.json_out.join("tools.json");

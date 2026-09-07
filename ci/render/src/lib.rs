@@ -1,12 +1,10 @@
-#[macro_use]
-extern crate serde_derive;
-
-use anyhow::Result;
-use chrono::{DateTime, Local, NaiveDateTime, Utc};
-use hubcaps::{Credentials, Github};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Local, Utc};
+use serde::Deserialize;
 use slug::slugify;
 use stats::StatsRaw;
 
+/// Entry validation rules.
 mod lints;
 pub mod stats;
 pub mod types;
@@ -19,65 +17,118 @@ fn valid(entry: &ParsedEntry, tags: &[Tag]) -> Result<()> {
     lints.iter().try_for_each(|lint| lint(entry, tags))
 }
 
-#[tokio::main]
-pub async fn check_deprecated(token: String, entries: &mut Vec<Entry>) -> Result<()> {
-    println!("Checking for deprecated entries on Github. This might take a while...");
-    let github = Github::new(
-        String::from("analysis tools bot"),
-        Credentials::Token(token),
-    )?;
+#[derive(Deserialize)]
+struct CommitResponse {
+    commit: Commit,
+}
+
+#[derive(Deserialize)]
+struct Commit {
+    author: CommitAuthor,
+}
+
+#[derive(Deserialize)]
+struct CommitAuthor {
+    date: DateTime<Utc>,
+}
+
+fn github_coordinates(source: &str) -> Option<(&str, &str)> {
+    let path = source
+        .strip_prefix("https://github.com/")
+        .or_else(|| source.strip_prefix("http://github.com/"))?
+        .trim_end_matches('/');
+    let (owner, repo) = path.split_once('/')?;
+    (!owner.is_empty() && !repo.is_empty() && !repo.contains('/')).then_some((owner, repo))
+}
+
+async fn latest_commit_date(
+    client: &reqwest::Client,
+    token: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/commits?per_page=1");
+    let response = client
+        .get(&url)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .with_context(|| format!("Failed to fetch commits for {owner}/{repo}"))?;
+
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::CONFLICT
+    ) {
+        return Ok(None);
+    }
+
+    let commits = response
+        .error_for_status()
+        .with_context(|| format!("GitHub rejected the commits request for {owner}/{repo}"))?
+        .json::<Vec<CommitResponse>>()
+        .await
+        .with_context(|| format!("Invalid commits response for {owner}/{repo}"))?;
+
+    Ok(commits
+        .into_iter()
+        .next()
+        .map(|commit| commit.commit.author.date))
+}
+
+/// Refreshes deprecation markers using each GitHub repository's latest commit.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be created or GitHub returns an
+/// unexpected response.
+pub async fn check_deprecated(token: &str, entries: &mut [Entry]) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .user_agent("analysis-tools-render/0.2")
+        .build()
+        .context("Failed to build GitHub HTTP client")?;
 
     for entry in entries {
-        if entry.source.is_none() {
-            continue;
-        }
-
-        let Some(source) = entry.source.as_ref() else {
+        let Some((owner, repo)) = entry.source.as_deref().and_then(github_coordinates) else {
             continue;
         };
-        let components: Vec<&str> = source.trim_end_matches('/').split('/').collect();
-        if !(components.contains(&"github.com") && components.len() == 5) {
-            // valid github source must have 5 elements - anything longer and they are probably a
-            // reference to a path inside a repo, rather than a repo itself.
-            continue;
-        }
-
-        let owner = components[3];
-        let repo = components[4];
-
-        if let Ok(commit_list) = github.repo(owner, repo).commits().list("").await {
-            let date = &commit_list[0].commit.author.date;
-            let last_commit = NaiveDateTime::parse_from_str(date, "%Y-%m-%dT%H:%M:%SZ")?;
-            let last_commit_utc: DateTime<Utc> =
-                DateTime::from_naive_utc_and_offset(last_commit, Utc);
-            let now = Local::now().date_naive();
-            let duration = now.signed_duration_since(last_commit_utc.date_naive());
-
-            if duration.num_days() > 365 {
-                entry.deprecated = Some(true);
-            } else {
-                entry.deprecated = None;
+        let last_commit = match latest_commit_date(&client, token, owner, repo).await {
+            Ok(Some(date)) => date,
+            Ok(None) => continue,
+            Err(error) => {
+                eprintln!("Could not check {owner}/{repo} for deprecation: {error:#}");
+                continue;
             }
-        }
+        };
+
+        let duration = Local::now()
+            .date_naive()
+            .signed_duration_since(last_commit.date_naive());
+        entry.deprecated = (duration.num_days() > 365).then_some(true);
     }
 
     Ok(())
 }
 
-pub fn create_catalog(entries: &[Entry], languages: &[Tag], other_tags: &[Tag]) -> Result<Catalog> {
-    // Move tools that support multiple programming languages into their own category
-    let (multi, entries): (Vec<Entry>, Vec<Entry>) = entries.iter().cloned().partition(|entry| {
-        let language_tags = entry
-            .tags
-            .iter()
-            .filter(|t| t.tag_type == Type::Language)
-            .count();
-        language_tags > 1 && !entry.is_c_cpp()
-    });
+/// Groups normalized entries for the generated README.
+#[must_use]
+pub fn create_catalog(entries: &[Entry], languages: &[Tag], other_tags: &[Tag]) -> Catalog {
+    // Multi-language tools get their own primary section instead of being repeated under
+    // every language. They still belong in applicable non-language tag sections.
+    let (multi, single_language): (Vec<Entry>, Vec<Entry>) =
+        entries.iter().cloned().partition(|entry| {
+            let language_tags = entry
+                .tags
+                .iter()
+                .filter(|t| t.kind == Type::Language)
+                .count();
+            language_tags > 1 && !entry.is_c_cpp()
+        });
 
     let mut linters = BTreeMap::new();
     for language in languages {
-        let list: Vec<Entry> = entries
+        let list: Vec<Entry> = single_language
             .iter()
             .filter(|e| e.tags.contains(language))
             .cloned()
@@ -89,7 +140,12 @@ pub fn create_catalog(entries: &[Entry], languages: &[Tag], other_tags: &[Tag]) 
 
     let mut others = BTreeMap::new();
     for other in other_tags {
-        let list: Vec<Entry> = entries
+        let entries_for_tag: &[Entry] = if other.include_multi {
+            entries
+        } else {
+            &single_language
+        };
+        let list: Vec<Entry> = entries_for_tag
             .iter()
             .filter(|e| e.tags.contains(other))
             .cloned()
@@ -99,26 +155,23 @@ pub fn create_catalog(entries: &[Entry], languages: &[Tag], other_tags: &[Tag]) 
         }
     }
 
-    Ok(Catalog {
+    Catalog {
         linters,
         others,
         multi,
-    })
+    }
 }
 
-pub fn create_api(catalog: Catalog, languages: &[Tag], other_tags: &[Tag]) -> Result<Api> {
+/// Converts normalized entries to the machine-readable API representation.
+#[must_use]
+pub fn create_api(entries: Vec<Entry>, languages: &[Tag], other_tags: &[Tag]) -> Api {
     let mut api_entries = BTreeMap::new();
-
-    // Concatenate all entries into one vector
-    let mut entries: Vec<Entry> = catalog.linters.into_values().flatten().collect();
-    entries.extend(catalog.others.into_values().flatten());
-    entries.extend(catalog.multi);
 
     for entry in entries {
         // Get the language data for the entry. We iterate over all languages
-        // and look up each language in the entry tags This is an O(n) operation
+        // and look up each language in the entry tags. This is an O(n) operation
         // as we iterate over the language list only once while the lookup is an
-        // O(1) operation thanks to the tag hash set.
+        // O(1) operation thanks to the tag set.
         let entry_languages = languages
             .iter()
             .filter_map(|lang| {
@@ -170,12 +223,92 @@ pub fn create_api(catalog: Catalog, languages: &[Tag], other_tags: &[Tag]) -> Re
         api_entries.insert(slugify(&entry.name), api_entry);
     }
 
-    Ok(api_entries)
+    api_entries
+}
+
+/// Converts raw page-view statistics into a tool-name lookup.
+#[must_use]
+pub fn format_stats(stats: StatsRaw) -> BTreeMap<String, String> {
+    stats
+        .data
+        .result
+        .into_iter()
+        .map(|result| {
+            (
+                result.metric.path.trim_start_matches("/tool/").to_string(),
+                result.value.1,
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    fn tag(name: &str, value: &str, kind: Type) -> Tag {
+        Tag {
+            name: name.into(),
+            value: value.into(),
+            kind,
+            include_multi: false,
+        }
+    }
+
+    fn entry(tags: &[Tag]) -> Entry {
+        Entry {
+            name: "Multi Tool".into(),
+            categories: BTreeSet::new(),
+            tags: tags.iter().cloned().collect(),
+            license: "MIT".into(),
+            types: BTreeSet::new(),
+            homepage: "https://example.com".into(),
+            source: None,
+            pricing: None,
+            plans: None,
+            description: "Example tool".into(),
+            discussion: None,
+            deprecated: None,
+            resources: None,
+            reviews: None,
+            demos: None,
+            wrapper: None,
+        }
+    }
+
+    #[test]
+    fn parses_github_repository_urls() {
+        assert_eq!(
+            github_coordinates("https://github.com/owner/repo"),
+            Some(("owner", "repo"))
+        );
+        assert_eq!(
+            github_coordinates("https://github.com/owner/repo/"),
+            Some(("owner", "repo"))
+        );
+        assert_eq!(
+            github_coordinates("https://github.com/owner/repo/tree/main"),
+            None
+        );
+        assert_eq!(github_coordinates("https://gitlab.com/owner/repo"), None);
+    }
+
+    #[test]
+    fn parses_github_commit_response() -> Result<()> {
+        let response: Vec<CommitResponse> =
+            serde_json::from_str(r#"[{"commit":{"author":{"date":"2026-08-01T12:34:56Z"}}}]"#)?;
+        let date = response
+            .into_iter()
+            .next()
+            .map(|commit| commit.commit.author.date);
+
+        assert_eq!(
+            date.map(|value| value.to_rfc3339()),
+            Some("2026-08-01T12:34:56+00:00".into())
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_slugify() {
@@ -190,18 +323,49 @@ mod tests {
             "it-has-dashes".to_string()
         );
     }
-}
 
-pub fn format_stats(stats: StatsRaw) -> BTreeMap<String, String> {
-    stats
-        .data
-        .result
-        .into_iter()
-        .map(|r| {
-            (
-                r.metric.path.trim_start_matches("/tool/").to_string(),
-                r.value.1,
-            )
-        })
-        .collect()
+    #[test]
+    fn multi_language_tools_remain_visible_in_other_sections_and_api() {
+        let python = tag("Python", "python", Type::Language);
+        let rust = tag("Rust", "rust", Type::Language);
+        let mut ai_generated = tag("AI-generated code", "ai-generated-code", Type::Other);
+        ai_generated.include_multi = true;
+        let tool = entry(&[python.clone(), rust.clone(), ai_generated.clone()]);
+        let languages = [python, rust];
+        let other_tags = [ai_generated.clone()];
+
+        let catalog = create_catalog(std::slice::from_ref(&tool), &languages, &other_tags);
+
+        assert!(catalog.linters.is_empty());
+        assert_eq!(catalog.multi.len(), 1);
+        assert_eq!(catalog.multi[0], tool);
+        assert_eq!(catalog.others[&ai_generated].len(), 1);
+        assert_eq!(catalog.others[&ai_generated][0], tool);
+
+        let api = create_api(vec![tool], &languages, &other_tags);
+        assert_eq!(api["multi-tool"].languages, ["python", "rust"]);
+        assert_eq!(api["multi-tool"].other, ["ai-generated-code"]);
+    }
+
+    #[test]
+    fn c_and_cpp_tools_stay_in_language_sections_when_they_have_other_tags() {
+        let c = tag("C", "c", Type::Language);
+        let cpp = tag("C++", "cpp", Type::Language);
+        let security = tag("Security/SAST", "security", Type::Other);
+        let tool = entry(&[c.clone(), cpp.clone(), security.clone()]);
+
+        let catalog = create_catalog(
+            std::slice::from_ref(&tool),
+            &[c.clone(), cpp.clone()],
+            std::slice::from_ref(&security),
+        );
+
+        assert!(catalog.multi.is_empty());
+        assert_eq!(catalog.linters[&c].len(), 1);
+        assert_eq!(catalog.linters[&c][0], tool);
+        assert_eq!(catalog.linters[&cpp].len(), 1);
+        assert_eq!(catalog.linters[&cpp][0], tool);
+        assert_eq!(catalog.others[&security].len(), 1);
+        assert_eq!(catalog.others[&security][0], tool);
+    }
 }
